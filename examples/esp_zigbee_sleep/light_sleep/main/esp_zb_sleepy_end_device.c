@@ -10,6 +10,27 @@
  * Unless required by applicable law or agreed to in writing, this
  * software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
  * CONDITIONS OF ANY KIND, either express or implied.
+ *
+ *
+ * Beschreibung: 
+ * Das Programm erstellt mit einen ESP32 H2 (DevKit) ein über Zigbee erreichbares Licht-Gerät als End Device.
+ * Der Controller befindet sich die meiste Zeit im light-sleep Modus und wacht zyklisch auf.
+ * Wird ein Einschaltbefehl empfangen wird GPIO 12 high gesetzt. Bei einem Ausschaltbefehl wird GPIO 12 low gesetzt.
+ * Zusammen mit einem FET als Low-Side-Schalter an GPIO 12 kann damit eine Last wie z.B. eine Lichterkette geschaltet werden.
+ * Es sollten Li-Ion Zellen (AA) verwendet werden, da diese eine Konstante Spannung (1,5V) über die gesamte Entladekurve der Batterie liefern. 
+ * Bei anderen Zellen würde die Spannung mit der Zeit langsam absinken und der Controller würde nicht mehr arbeiten können bevor die Batterien ganz leer sind.
+ * 
+ * Eine Ansteuerung mit PWM am IO des FET ist nicht möglich, da als Last der interne LED-Treiber der Lichterkette verwendet wird. Der LED-Treiber der Lichterkette
+ * braucht zu lange nach dem zuschalten der Spannung bis er die LED einschaltet. Bei einer Lichterkette waren es z.B. 168 ms. Somit ist keine hohe PWM-Frequenz möglich
+ * und somit auch kein Dimmen der LED.  
+ *
+ * Versionsverlauf:
+ * 13.12.2024, Florian, Erstellt 
+ *
+ *
+ *
+ *
+ *
  */
 #include "esp_check.h"
 #include "hal/gpio_types.h"
@@ -70,10 +91,10 @@ static esp_err_t deferred_driver_init(void)
     if (!is_inited) {
         ESP_RETURN_ON_FALSE(switch_driver_init(button_func_pair, PAIR_SIZE(button_func_pair), zb_buttons_handler),
                             ESP_FAIL, TAG, "Failed to initialize switch driver");
-        /* Configure RTC IO wake up:
-        The configuration mode depends on your hardware design.
-        Since the BOOT button is connected to a pull-up resistor, the wake-up mode is configured as LOW.
-        */
+    /* Configure RTC IO wake up:
+    The configuration mode depends on your hardware design.
+    Since the BOOT button is connected to a pull-up resistor, the wake-up mode is configured as LOW.
+    */
         ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(BIT(CONFIG_GPIO_EXT1_WAKEUP_SOURCE), ESP_EXT1_WAKEUP_ANY_LOW));
 
 #if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
@@ -177,6 +198,21 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
         if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
                 light_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : light_state;
+                if(light_state == 1)                        // wenn Befehl Licht ein
+                {
+                    gpio_hold_dis(12);                      // GPIO Spannung halten deaktivieren
+                    gpio_set_level(12, 1);                  // GPIO 12 high (FET bzw. Licht einschalten)
+                    gpio_hold_en(12);                       // GPIO Spannung halten aktivieren
+                    ESP_LOGI(TAG, "GPIO 12 high");
+                }
+                else                                        // wenn Befehl Licht aus
+                {
+                    gpio_hold_dis(12);                      // GPIO Spannung halten deaktivieren
+                    gpio_set_level(12, 0);                  // GPIO 12 high (FET bzw. Licht ausschalten)
+                    gpio_hold_en(12);                       // GPIO Spannung halten aktivieren
+                    ESP_LOGI(TAG, "GPIO 12 low");
+                }
+
                 ESP_LOGI(TAG, "Light sets to %s", light_state ? "On" : "Off");
             }
         }
@@ -227,6 +263,62 @@ void app_main(void)
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
+
+esp_reset_reason_t reason = esp_reset_reason();
+
+    printf("Reset reason: ");
+    switch (reason) {
+        case ESP_RST_POWERON:
+            printf("Power-on reset\n");
+            break;
+        case ESP_RST_EXT:
+            printf("External reset\n");
+            break;
+        case ESP_RST_SW:
+            printf("Software reset\n");
+            break;
+        case ESP_RST_PANIC:
+            printf("Exception/panic reset\n");
+            break;
+        case ESP_RST_INT_WDT:
+            printf("Interrupt watchdog reset\n");
+            break;
+        case ESP_RST_TASK_WDT:
+            printf("Task watchdog reset\n");
+            break;
+        case ESP_RST_WDT:
+            printf("Other watchdog reset\n");
+            break;
+        case ESP_RST_BROWNOUT:
+            printf("Brownout reset\n");
+            break;
+        case ESP_RST_SDIO:
+            printf("SDIO reset\n");
+            break;
+        default:
+            printf("Unknown reason\n");
+            break;
+    }
+
+    //zero-initialize the config structure.
+    gpio_config_t io_conf = {};
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //bit mask of the pins that you want to set,e.g.GPIO18/19
+    io_conf.pin_bit_mask = 1ULL<<12;
+    //disable pull-down mode
+    io_conf.pull_down_en = 1;
+    //disable pull-up mode
+    io_conf.pull_up_en = 0;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+
+    gpio_set_level(12, 0);
+    gpio_hold_en(12);
+    ESP_LOGI(TAG, "GPIO 12 low init");
+
     ESP_ERROR_CHECK(nvs_flash_init());
     /* esp zigbee light sleep initialization*/
     ESP_ERROR_CHECK(esp_zb_power_save_init());
