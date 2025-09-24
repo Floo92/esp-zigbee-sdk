@@ -16,16 +16,14 @@
  * Das Programm erstellt mit einen ESP32 H2 (DevKit) ein über Zigbee erreichbares Licht-Gerät als End Device.
  * Der Controller befindet sich die meiste Zeit im light-sleep Modus und wacht zyklisch auf.
  * Wird ein Einschaltbefehl empfangen wird GPIO 12 high gesetzt. Bei einem Ausschaltbefehl wird GPIO 12 low gesetzt.
- * Zusammen mit einem FET als Low-Side-Schalter an GPIO 12 kann damit eine Last wie z.B. eine Lichterkette geschaltet werden.
+ * Zusammen mit einem FET als Low-Side-Schalter an GPIO 12 kann damit eine Last wie z.B. eine Lichterkette geschaltet werden. Alternatic kann direkt an GPIO 12 ein externer LED-Treiber betrieben werden.
  * Es sollten Li-Ion Zellen (AA) verwendet werden, da diese eine Konstante Spannung (1,5V) über die gesamte Entladekurve der Batterie liefern. 
  * Bei anderen Zellen würde die Spannung mit der Zeit langsam absinken und der Controller würde nicht mehr arbeiten können bevor die Batterien ganz leer sind.
  * 
- * Eine Ansteuerung mit PWM am IO des FET ist nicht möglich, da als Last der interne LED-Treiber der Lichterkette verwendet wird. Der LED-Treiber der Lichterkette
- * braucht zu lange nach dem zuschalten der Spannung bis er die LED einschaltet. Bei einer Lichterkette waren es z.B. 168 ms. Somit ist keine hohe PWM-Frequenz möglich
- * und somit auch kein Dimmen der LED.  
  *
  * Versionsverlauf:
  * 13.12.2024, Florian, Erstellt 
+ * 24.09.2025, Florian, LEDC-Modul für PWM hinzugefügt
  *
  *
  *
@@ -48,6 +46,24 @@
 #endif
 #include "driver/rtc_io.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
+
+#define SLEEP_ENABLE            // aktiviert light sleep
+#define GPIO_CONTROL            // verwendet GPIO high/low anstatt PWM
+
+#define LEDC_TIMER              LEDC_TIMER_0
+#define LEDC_MODE               LEDC_LOW_SPEED_MODE
+#define LEDC_OUTPUT_IO          (12) // Define the output GPIO
+#define LEDC_CHANNEL            LEDC_CHANNEL_0
+#define LEDC_DUTY_RES           LEDC_TIMER_12_BIT // Set duty resolution to 13 bits
+#define LEDC_DUTY               (4096) // Set duty to 50%. (2 ** 12) * 100% = 4096
+#define LEDC_FREQUENCY          (1000) // Frequency in Hertz. Set frequency at 4 kHz
+
+/* Warning:
+ * For ESP32, ESP32S2, ESP32S3, ESP32C3, ESP32C2, ESP32C6, ESP32H2 (rev < 1.2), ESP32P4 targets,
+ * when LEDC_DUTY_RES selects the maximum duty resolution (i.e. value equal to SOC_LEDC_TIMER_BIT_WIDTH),
+ * 100% duty cycle is not reachable (duty cannot be set to (2 ** SOC_LEDC_TIMER_BIT_WIDTH)).
+ */
 
 /**
  * @note Make sure set idf.py menuconfig in zigbee component as zigbee end device!
@@ -158,8 +174,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         break;
       case ESP_ZB_COMMON_SIGNAL_CAN_SLEEP:
+#ifdef SLEEP_ENABLE
         ESP_LOGI(TAG, "Zigbee can sleep");
         esp_zb_sleep_now();
+#endif
         break;
     default:
         ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s", esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status));
@@ -200,17 +218,30 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
                 light_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : light_state;
                 if(light_state == 1)                        // wenn Befehl Licht ein
                 {
+#ifdef GPIO_CONTROL
                     gpio_hold_dis(12);                      // GPIO Spannung halten deaktivieren
                     gpio_set_level(12, 1);                  // GPIO 12 high (FET bzw. Licht einschalten)
                     gpio_hold_en(12);                       // GPIO Spannung halten aktivieren
                     ESP_LOGI(TAG, "GPIO 12 high");
+#else
+                    // Set duty to X%
+                    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 4095));
+                    // Update duty to apply the new value
+                    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+                    ESP_LOGI(TAG, "PWM higher");
+#endif
                 }
                 else                                        // wenn Befehl Licht aus
                 {
+#ifdef GPIO_CONTROL
                     gpio_hold_dis(12);                      // GPIO Spannung halten deaktivieren
                     gpio_set_level(12, 0);                  // GPIO 12 high (FET bzw. Licht ausschalten)
                     gpio_hold_en(12);                       // GPIO Spannung halten aktivieren
                     ESP_LOGI(TAG, "GPIO 12 low");
+#else
+                    ledc_stop(LEDC_MODE, LEDC_CHANNEL, 0);
+                    ESP_LOGI(TAG, "PWM inaktiv");
+#endif
                 }
 
                 ESP_LOGI(TAG, "Light sets to %s", light_state ? "On" : "Off");
@@ -238,8 +269,10 @@ static void esp_zb_task(void *pvParameters)
 {
     /* initialize Zigbee stack with Zigbee end-device config */
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
+#ifdef SLEEP_ENABLE
     /* Enable zigbee light sleep */
     esp_zb_sleep_enable(true);
+#endif
     esp_zb_init(&zb_nwk_cfg);
     /* set the on-off light device config */
     esp_zb_on_off_light_cfg_t light_cfg = ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG();
@@ -255,6 +288,32 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
     esp_zb_stack_main_loop();
+}
+
+static void ledc_init(void)
+{
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .timer_num        = LEDC_TIMER,
+        .freq_hz          = LEDC_FREQUENCY,  // Set output frequency at 4 kHz
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = LEDC_OUTPUT_IO,
+        .duty           = 0, // Set duty to 0%
+        .hpoint         = 0,
+        .sleep_mode     = LEDC_SLEEP_MODE_KEEP_ALIVE
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 }
 
 void app_main(void)
@@ -300,6 +359,7 @@ esp_reset_reason_t reason = esp_reset_reason();
             break;
     }
 
+#ifdef GPIO_CONTROL
     //zero-initialize the config structure.
     gpio_config_t io_conf = {};
     //disable interrupt
@@ -318,7 +378,14 @@ esp_reset_reason_t reason = esp_reset_reason();
     gpio_set_level(12, 0);
     gpio_hold_en(12);
     ESP_LOGI(TAG, "GPIO 12 low init");
-
+#else
+    // Set the LEDC peripheral configuration
+    ledc_init();
+    // Set duty to 50%
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY));
+    // Update duty to apply the new value
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+#endif
     ESP_ERROR_CHECK(nvs_flash_init());
     /* esp zigbee light sleep initialization*/
     ESP_ERROR_CHECK(esp_zb_power_save_init());
